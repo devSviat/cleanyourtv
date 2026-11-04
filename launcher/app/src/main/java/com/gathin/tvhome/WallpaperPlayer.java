@@ -48,6 +48,8 @@ final class WallpaperPlayer {
     private final int dimColor;
     /** The picture on screen, released once the next one has been drawn. */
     private Bitmap current;
+    /** dock_blur: receives a blurred copy of each picture shown; null when off. */
+    private final DockBackdrop backdrop;
     private boolean active;
     private boolean closed;
     private boolean loading;
@@ -62,8 +64,9 @@ final class WallpaperPlayer {
     private LocalDate sunDay;
     private int[] sun;
 
-    WallpaperPlayer(Context context, FrameLayout root, Config config) {
+    WallpaperPlayer(Context context, FrameLayout root, Config config, DockBackdrop backdrop) {
         this.root = root;
+        this.backdrop = backdrop;
         backgroundColor = config.backgroundColor;
         files = new ArrayList<>(config.wallpapers);
         interval = config.wallpaperRotationMinutes * 60_000L;
@@ -88,6 +91,7 @@ final class WallpaperPlayer {
         image = new ImageView(context);
         image.setScaleType(ImageView.ScaleType.CENTER_CROP);
         image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        if (backdrop != null) backdrop.setSource(image);
         names = config.wallpaperCaptions && config.wallpaperEnabled && !files.isEmpty()
                 ? WallpaperCaptions.read(files.get(0).getParentFile()) : Collections.emptyMap();
         caption = names.isEmpty() ? null : makeCaption(context, root);
@@ -109,7 +113,7 @@ final class WallpaperPlayer {
         File first = WallpaperRotation.find(playable, previous);
         if (first == null) first = WallpaperRotation.pick(playable, previous, order, random);
         while (first != null) {
-            Bitmap bitmap = decode(first);
+            Decoded bitmap = decode(first);
             if (bitmap != null) {
                 show(bitmap);
                 // The picture covers the whole screen: the root's plain colour under it is overdraw.
@@ -179,11 +183,11 @@ final class WallpaperPlayer {
         File next = selected;
         loading = true;
         decoder.execute(() -> {
-            Bitmap bitmap = decode(next);
+            Decoded bitmap = decode(next);
             root.post(() -> {
                 loading = false;
                 if (closed || !active) {
-                    if (bitmap != null) bitmap.recycle();
+                    if (bitmap != null) bitmap.picture.recycle();
                     return;
                 }
                 if (bitmap == null) {
@@ -260,16 +264,29 @@ final class WallpaperPlayer {
     }
 
     /** Puts a picture on screen and releases the previous one after a frame has drawn the new one. */
-    private void show(Bitmap bitmap) {
+    private void show(Decoded decoded) {
+        Bitmap bitmap = decoded.picture;
         Bitmap old = current;
         current = bitmap;
         // The wallpaper covers the whole root; avoid drawing the fallback colour under it.
         root.setBackground(null);
         image.setImageBitmap(bitmap);
+        if (backdrop != null) backdrop.set(decoded.blurred, bitmap.getWidth(), bitmap.getHeight());
         if (old != null && old != bitmap) image.postDelayed(old::recycle, 500);
     }
 
-    private Bitmap decode(File file) {
+    /** A decoded picture, and its blurred copy for dock_blur (null when off or it could not be made). */
+    private static final class Decoded {
+        final Bitmap picture;
+        final Bitmap blurred;
+
+        Decoded(Bitmap picture, Bitmap blurred) {
+            this.picture = picture;
+            this.blurred = blurred;
+        }
+    }
+
+    private Decoded decode(File file) {
         try {
             BitmapFactory.Options options = new BitmapFactory.Options();
             options.inJustDecodeBounds = true;
@@ -291,12 +308,14 @@ final class WallpaperPlayer {
             Bitmap decoded = BitmapFactory.decodeFile(file.getPath(), options);
             if (decoded == null) return null;
             if (dimColor != 0) new Canvas(decoded).drawColor(dimColor);
+            // Blurred before the hardware copy below: a HARDWARE bitmap's pixels cannot be read.
+            Bitmap blurred = backdrop != null ? DockBackdrop.blur(decoded) : null;
             // One copy in GPU memory instead of a software bitmap plus its texture; the decode stays off the UI
             // thread for rotations, and Home's return no longer uploads 4-8 MB to the GPU.
             Bitmap gpu = decoded.copy(Bitmap.Config.HARDWARE, false);
-            if (gpu == null) return decoded;
+            if (gpu == null) return new Decoded(decoded, blurred);
             decoded.recycle();
-            return gpu;
+            return new Decoded(gpu, blurred);
         } catch (Exception | OutOfMemoryError failure) {
             return null;
         }
